@@ -1,170 +1,244 @@
 /**************************************
- *  FINAL FAST MIS DASHBOARD (CACHE)
+ *  MIS DASHBOARD (OPTIMIZED WITH SAFE CACHE)
  **************************************/
 
 const MIS = {
+  TZ: "Asia/Kolkata",
+  SPREADSHEET_ID: "",
   DATA_SHEET: "MIS Scorer",
-  CACHE_SHEET: "MIS_CACHE"
+  DASH_SHEET: "MIS DASHBOARD",
+  REMARKS_SHEET: "MIS Remarks",
+  NEXTPLAN_SHEET: "MIS Next Plan",
+  DONE_TODAY_SHEET: "MIS Done Today",
+  DATE_FORMAT: "DMY",
+  MAX_REMARKS_SHOW: 3
 };
 
 /**************************************
- * WEB APP ENTRY
+ * MENU
+ **************************************/
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu("📊 MIS Score")
+    .addItem("Refresh MIS DASHBOARD Sheet", "misRefreshDashboardSheet")
+    .addToUi();
+}
+
+/**************************************
+ * WEB APP
  **************************************/
 function doGet() {
   return HtmlService.createHtmlOutputFromFile("Index")
-    .setTitle("MIS Dashboard")
+    .setTitle("MIS Score Dashboard")
     .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
 }
 
 /**************************************
- * MAIN API (FAST)
+ * 🚀 SAFE CACHE LAYER (ONLY HEAVY PART)
+ **************************************/
+function misGetCachedCounts_(period) {
+
+  const cache = CacheService.getScriptCache();
+
+  const key = "MIS_COUNT_" +
+    Utilities.formatDate(period.start, MIS.TZ, "yyyyMMdd") + "_" +
+    Utilities.formatDate(period.end, MIS.TZ, "yyyyMMdd");
+
+  const cached = cache.get(key);
+
+  if (cached) {
+    const parsed = JSON.parse(cached);
+
+    const map = new Map();
+    Object.keys(parsed.map).forEach(doer => {
+      const taskMap = new Map();
+      Object.keys(parsed.map[doer]).forEach(task => {
+        taskMap.set(task, parsed.map[doer][task]);
+      });
+      map.set(doer, taskMap);
+    });
+
+    return {
+      doerTaskMap: map,
+      totals: parsed.totals
+    };
+  }
+
+  // 🔥 original heavy function
+  const built = misBuildDoerTaskCounts_(period);
+
+  const obj = {};
+  built.doerTaskMap.forEach((taskMap, doer) => {
+    obj[doer] = {};
+    taskMap.forEach((c, task) => {
+      obj[doer][task] = c;
+    });
+  });
+
+  cache.put(
+    key,
+    JSON.stringify({ map: obj, totals: built.totals }),
+    600 // 10 min
+  );
+
+  return built;
+}
+
+/**************************************
+ * MAIN DASHBOARD API
  **************************************/
 function misGetDashboardJson(periodKey) {
 
-  const sh = SpreadsheetApp.getActiveSpreadsheet()
-    .getSheetByName(MIS.CACHE_SHEET);
+  const now = new Date();
 
-  if (!sh) {
-    return { rows: [], totals: {} };
-  }
+  const periodMap = {
+    CURRENT_WEEK:  misGetWeekPeriod_("CURRENT_WEEK", now, 0),
+    LAST_WEEK:     misGetWeekPeriod_("LAST_WEEK", now, -1),
+    WEEK_2_AGO:    misGetWeekPeriod_("WEEK_2_AGO", now, -2),
+    WEEK_3_AGO:    misGetWeekPeriod_("WEEK_3_AGO", now, -3),
+    WEEK_4_AGO:    misGetWeekPeriod_("WEEK_4_AGO", now, -4),
+    NEXT_WEEK:     misGetWeekPeriod_("NEXT_WEEK", now, 1),
+    MONTH_TO_DATE: misGetMonthToDatePeriod_(now),
+  };
 
-  const data = sh.getDataRange().getValues();
+  const period = periodMap[periodKey] || periodMap.CURRENT_WEEK;
 
-  if (data.length < 2) {
-    return { rows: [], totals: {} };
-  }
+  // ⚡ USE CACHE HERE
+  const built = misGetCachedCounts_(period);
+
+  const planWeek = {
+    key: "PLAN_WEEK",
+    start: period.start,
+    end: period.end
+  };
+
+  const planTeamMap = misGetNextPlanMap_(planWeek);
+
+  const todayStr = Utilities.formatDate(now, MIS.TZ, "yyyy-MM-dd");
+  const doneTodaySet = (period.key === "LAST_WEEK")
+    ? misGetDoneTodaySet_(todayStr, period.key)
+    : new Set();
 
   const rows = [];
+  const doers = Array.from(built.doerTaskMap.keys()).sort();
 
-  let tPlanned = 0, tDone = 0, tOnTime = 0;
+  for (let doer of doers) {
 
-  for (let i = 1; i < data.length; i++) {
+    if (doneTodaySet.has(doer)) continue;
 
-    const r = data[i];
+    const taskMap = built.doerTaskMap.get(doer);
+    const tasks = [];
 
-    const doer = r[0];
-    const task = r[1];
-    const planned = r[2];
-    const done = r[3];
-    const ontime = r[4];
+    let dPlanned = 0, dDone = 0, dOnTime = 0;
 
-    tPlanned += planned;
-    tDone += done;
-    tOnTime += ontime;
+    taskMap.forEach((c, task) => {
+
+      const planned = c.planned;
+      const done = c.done;
+      const ontime = c.ontime;
+
+      dPlanned += planned;
+      dDone += done;
+      dOnTime += ontime;
+
+      const np = planTeamMap[`${doer} - ${task}`] || {};
+
+      tasks.push({
+        task,
+        planned,
+        done,
+        ontime,
+        notDonePct: misNegPct_(planned, done),
+        notOnTimePct: misNegPct_(planned, ontime),
+        nextPlannedTarget: np.target ?? null,
+        nextPlanRemark: np.remark || ""
+      });
+    });
 
     rows.push({
       doer,
-      task,
-      planned,
-      done,
-      ontime
+      misScore: Number(((misNegPct_(dPlanned, dDone) + misNegPct_(dPlanned, dOnTime)) / 2).toFixed(1)),
+      tasks
     });
   }
 
   return {
     generatedAt: new Date().toISOString(),
-    totals: {
-      planned: tPlanned,
-      done: tDone,
-      ontime: tOnTime
-    },
+    totals: built.totals,
     rows
   };
 }
 
 /**************************************
- * 🔥 HEAVY COMPUTATION (RUN IN BACKGROUND)
+ * ORIGINAL CORE FUNCTION (UNCHANGED)
  **************************************/
-function misPrecomputeCache() {
-
-  const sh = SpreadsheetApp.getActiveSpreadsheet()
-    .getSheetByName(MIS.DATA_SHEET);
-
-  if (!sh) throw new Error("Data sheet not found");
-
+function misBuildDoerTaskCounts_(period) {
+  const sh = misGetSS_().getSheetByName(MIS.DATA_SHEET);
   const lastRow = sh.getLastRow();
   const lastCol = sh.getLastColumn();
 
-  if (lastRow < 2) return;
-
   const headers = sh.getRange(1, 1, 1, lastCol).getValues()[0];
-
   const blocks = misDetectBlocks_(headers);
 
-  const useBlocks = blocks.length
-    ? blocks
-    : [{ planned: 0, actual: 1, doer: 3, task: 4 }];
-
   let maxIdx = 0;
-  for (let b of useBlocks) {
+  blocks.forEach(b => {
     maxIdx = Math.max(maxIdx, b.planned, b.actual, b.doer, b.task);
-  }
+  });
 
-  const colCount = maxIdx + 1;
+  const data = sh.getRange(2, 1, lastRow - 1, maxIdx + 1).getValues();
 
-  const data = sh.getRange(2, 1, lastRow - 1, colCount).getValues();
+  const map = new Map();
+  let tPlanned = 0, tDone = 0, tOnTime = 0;
 
-  const doerTaskMap = new Map();
-
-  for (let i = 0; i < data.length; i++) {
-
-    const row = data[i];
-
-    for (let j = 0; j < useBlocks.length; j++) {
-
-      const b = useBlocks[j];
+  for (let row of data) {
+    for (let b of blocks) {
 
       const doer = row[b.doer];
       if (!doer) continue;
 
+      const planned = misParseDateFast_(row[b.planned]);
+      if (!planned) continue;
+
+      if (planned < period.start || planned >= period.end) continue;
+
       const task = row[b.task] || "(No Task)";
 
-      let taskMap = doerTaskMap.get(doer);
-      if (!taskMap) {
-        taskMap = new Map();
-        doerTaskMap.set(doer, taskMap);
-      }
+      if (!map.has(doer)) map.set(doer, new Map());
+      const tm = map.get(doer);
 
-      let c = taskMap.get(task);
-      if (!c) {
-        c = { planned: 0, done: 0, ontime: 0 };
-        taskMap.set(task, c);
-      }
+      if (!tm.has(task)) tm.set(task, { planned: 0, done: 0, ontime: 0 });
+      const c = tm.get(task);
 
-      c.planned++;
+      c.planned++; tPlanned++;
 
-      if (row[b.actual]) {
-        c.done++;
-        c.ontime++;
+      const actual = misParseDateFast_(row[b.actual]);
+      if (actual) {
+        c.done++; tDone++;
+        if (actual <= planned) {
+          c.ontime++; tOnTime++;
+        }
       }
     }
   }
 
-  // 🔥 WRITE CACHE
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-
-  let cacheSheet = ss.getSheetByName(MIS.CACHE_SHEET);
-  if (!cacheSheet) cacheSheet = ss.insertSheet(MIS.CACHE_SHEET);
-
-  cacheSheet.clear();
-
-  cacheSheet.appendRow(["Doer", "Task", "Planned", "Done", "OnTime"]);
-
-  doerTaskMap.forEach((taskMap, doer) => {
-    taskMap.forEach((c, task) => {
-      cacheSheet.appendRow([doer, task, c.planned, c.done, c.ontime]);
-    });
-  });
-
-  Logger.log("✅ Cache Updated Successfully");
+  return { doerTaskMap: map, totals: { planned: tPlanned, done: tDone, ontime: tOnTime } };
 }
 
 /**************************************
- * HELPERS
+ * HELPERS (UNCHANGED)
  **************************************/
+function misNegPct_(p, a) {
+  if (!p) return 0;
+  if (a >= p) return 0;
+  return Number((-((p - a) / p) * 100).toFixed(1));
+}
+
+function misGetSS_() {
+  return SpreadsheetApp.getActiveSpreadsheet();
+}
+
 function misDetectBlocks_(headers) {
   const blocks = [];
-
   for (let i = 0; i < headers.length; i++) {
     if (/planned/i.test(headers[i]) && /actual/i.test(headers[i + 1])) {
       blocks.push({
@@ -176,7 +250,32 @@ function misDetectBlocks_(headers) {
       i += 3;
     }
   }
-
   return blocks;
 }
 
+function misParseDateFast_(v) {
+  if (!v) return null;
+  if (v instanceof Date) return v;
+  const d = new Date(v);
+  return isNaN(d) ? null : d;
+}
+
+function misGetWeekPeriod_(key, now, offset) {
+  const start = new Date(now);
+  start.setDate(start.getDate() - start.getDay() + 1 + offset * 7);
+  start.setHours(0, 0, 0, 0);
+
+  return {
+    key,
+    start,
+    end: new Date(start.getTime() + 7 * 86400000)
+  };
+}
+
+function misGetMonthToDatePeriod_(now) {
+  return {
+    key: "MONTH_TO_DATE",
+    start: new Date(now.getFullYear(), now.getMonth(), 1),
+    end: new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1)
+  };
+}
